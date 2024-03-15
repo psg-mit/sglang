@@ -49,7 +49,7 @@ class DetokenizerManager:
                     if recv_obj.hit_stop_str[i] is not None:
                         pos = output_strs[i].find(recv_obj.hit_stop_str[i])
                         if pos != -1:
-                            output_strs[i] = output_strs[i][:pos]
+                            output_strs[i] = output_strs[i][:pos+len(recv_obj.hit_stop_str[i])]
 
                     if len(output_tokens[i]) > 0:
                         first_token = self.tokenizer.convert_ids_to_tokens(
