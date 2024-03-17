@@ -149,22 +149,24 @@ class ModelRpcServer(rpyc.Service):
         self.new_token_ratio_step = (0.0001, 0.05)  # (down, up)
 
     def flush_cache(self):
-        if len(self.forward_queue) == 0 and (
-            self.running_batch is None or len(self.running_batch.reqs) == 0
-        ):
-            self.tree_cache.reset()
-            self.tree_cache_metrics = {"total": 0, "hit": 0}
-            self.regex_fsm_cache.reset()
-            self.req_to_token_pool.clear()
-            self.token_to_kv_pool.clear()
-            torch.cuda.empty_cache()
-            logger.info("Cache flushed successfully!")
-        else:
-            warnings.warn(
-                "Cache not flushed because there are pending requests. "
-                f"#queue-req: {len(self.forward_queue)}, "
-                f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
-            )
+        # if len(self.forward_queue) == 0 and (
+        #     self.running_batch is None or len(self.running_batch.reqs) == 0
+        # ):
+        self.forward_queue = []
+        self.running_batch = None
+        self.tree_cache.reset()
+        self.tree_cache_metrics = {"total": 0, "hit": 0}
+        self.regex_fsm_cache.reset()
+        self.req_to_token_pool.clear()
+        self.token_to_kv_pool.clear()
+        torch.cuda.empty_cache()
+        logger.info("Cache flushed successfully!")
+        # else:
+        #     warnings.warn(
+        #         "Cache not flushed because there are pending requests. "
+        #         f"#queue-req: {len(self.forward_queue)}, "
+        #         f"#running-req: {0 if self.running_batch is None else len(self.running_batch.reqs)}"
+        #     )
 
     def exposed_step(self, recv_reqs):
         if self.tp_size != 1:
