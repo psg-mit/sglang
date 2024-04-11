@@ -1,6 +1,7 @@
-# Adapted from:
-# https://github.com/vllm-project/vllm/blob/d65fac2738f0287a41955b45df76a2d5a919bff6/vllm/model_executor/models/gemma.py
-"""Inference-only Gemma model compatible with HuggingFace weights."""
+# This code is based on:
+# https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/stablelm.py
+"""Inference-only StableLM-2 (https://huggingface.co/stabilityai/stablelm-2-1_6b)
+model compatible with HuggingFace weights."""
 from typing import Optional, Tuple
 
 import torch
@@ -9,9 +10,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.router.model_runner import InputMetadata
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.config import LoRAConfig
-from vllm.model_executor.layers.activation import GeluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     MergedColumnParallelLinear,
@@ -19,7 +18,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
@@ -29,93 +31,98 @@ from vllm.model_executor.weight_utils import (
 )
 
 
-class GemmaMLP(nn.Module):
+class StablelmMLP(nn.Module):
     def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        linear_method: Optional[LinearMethodBase] = None,
+        self, config: PretrainedConfig, linear_method: Optional[LinearMethodBase] = None
     ) -> None:
         super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
+            config.hidden_size,
+            [config.intermediate_size] * 2,
             bias=False,
             linear_method=linear_method,
         )
         self.down_proj = RowParallelLinear(
-            intermediate_size, hidden_size, bias=False, linear_method=linear_method
+            config.intermediate_size, config.hidden_size, bias=False
         )
-        self.act_fn = GeluAndMul()
+        self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
 
-class GemmaAttention(nn.Module):
+class StablelmAttention(nn.Module):
     def __init__(
         self,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
+        config: PretrainedConfig,
         layer_id: int = 0,
-        max_position_embeddings: int = 8192,
-        rope_theta: float = 10000,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
-        self.hidden_size = hidden_size
+        self.config = config
+        self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
+        self.total_num_heads = config.num_attention_heads
         self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
+
+        self.total_num_key_value_heads = config.num_key_value_heads
+        if self.total_num_key_value_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_key_value_heads % tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = head_dim
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
+            assert tp_size % self.total_num_key_value_heads == 0
+        self.num_key_value_heads = max(1, self.total_num_key_value_heads // tp_size)
+        self.head_dim = self.hidden_size // self.total_num_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        rope_pct = getattr(
+            config, "rope_pct", getattr(config, "partial_rotary_factor", 1)
+        )
+        self.rotary_ndims = int(self.head_dim * rope_pct)
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_key_value_heads * self.head_dim
+        self.qkv_bias = getattr(config, "use_qkv_bias", False)
+        if (self.head_dim * self.num_heads * tp_size) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads "
+                f"(got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
 
         self.qkv_proj = QKVParallelLinear(
-            hidden_size,
+            self.hidden_size,
             self.head_dim,
             self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=False,
+            self.total_num_key_value_heads,
+            self.qkv_bias,
             linear_method=linear_method,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
-            hidden_size,
+            self.hidden_size,
             bias=False,
             linear_method=linear_method,
         )
-
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=self.rope_theta,
-            is_neox_style=True,
+            rotary_dim=self.rotary_ndims,
+            max_position=self.config.max_position_embeddings,
+            base=self.config.rope_theta,
         )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=self.num_key_value_heads,
             layer_id=layer_id,
         )
 
@@ -133,7 +140,7 @@ class GemmaAttention(nn.Module):
         return output
 
 
-class GemmaDecoderLayer(nn.Module):
+class StablelmDecoderLayer(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -141,72 +148,54 @@ class GemmaDecoderLayer(nn.Module):
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.self_attn = GemmaAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
-            layer_id=layer_id,
-            max_position_embeddings=config.max_position_embeddings,
-            rope_theta=config.rope_theta,
-            linear_method=linear_method,
-        )
-        self.mlp = GemmaMLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            linear_method=linear_method,
-        )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.self_attn = StablelmAttention(config, layer_id=layer_id)
+        self.mlp = StablelmMLP(config, linear_method)
+        norm_eps = getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-05))
+        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=norm_eps)
+        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=norm_eps)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
-        residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             input_metadata=input_metadata,
         )
+        hidden_states = residual + hidden_states
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
         return hidden_states, residual
 
 
-class GemmaModel(nn.Module):
+class StableLMEpochModel(nn.Module):
     def __init__(
-        self,
-        config: PretrainedConfig,
-        linear_method: Optional[LinearMethodBase] = None,
+        self, config: PretrainedConfig, linear_method: Optional[LinearMethodBase] = None
     ) -> None:
         super().__init__()
-        self.config = config
-
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
         )
         self.layers = nn.ModuleList(
             [
-                GemmaDecoderLayer(config, i, linear_method)
+                StablelmDecoderLayer(config, i, linear_method)
                 for i in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        norm_eps = getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-05))
+        self.norm = nn.LayerNorm(config.hidden_size, eps=norm_eps)
 
     def forward(
         self,
@@ -219,61 +208,30 @@ class GemmaModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-
-        # Normalize the embedding by sqrt(hidden_size)
-        hidden_states *= self.config.hidden_size**0.5
-
-        residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 input_metadata,
-                residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
-class GemmaForCausalLM(nn.Module):
-    packed_modules_mapping = {
-        "qkv_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-        ],
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
-        ],
-    }
-
-    # LoRA specific attributes
-    supported_lora_modules = [
-        "qkv_proj",
-        "o_proj",
-        "gate_up_proj",
-        "down_proj",
-    ]
-    # Gemma does not apply LoRA to the embedding layer.
-    embedding_modules = {}
-    embedding_padding_modules = []
-
+class StableLmForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
         linear_method: Optional[LinearMethodBase] = None,
-        lora_config: Optional[LoRAConfig] = None,
     ) -> None:
-        del lora_config  # Unused.
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.model = GemmaModel(config, linear_method)
+        self.model = StableLMEpochModel(config, linear_method)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -283,7 +241,7 @@ class GemmaForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
         return self.logits_processor(
-            input_ids, hidden_states, self.model.embed_tokens.weight, input_metadata
+            input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
 
     def load_weights(
@@ -302,14 +260,19 @@ class GemmaForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        loaded_params = set()
         for name, loaded_weight in hf_model_weights_iterator(
             model_name_or_path, cache_dir, load_format, revision
         ):
-            for param_name, shard_name, shard_id in stacked_params_mapping:
-                if shard_name not in name:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
                     continue
-                name = name.replace(shard_name, param_name)
+                name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -321,20 +284,9 @@ class GemmaForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # GemmaRMSNorm is different from Llama's in that it multiplies
-                # (1 + weight) to the output, instead of just weight.
-                if "norm.weight" in name:
-                    loaded_weight += 1.0
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            raise RuntimeError(
-                "Some weights are not initialized from checkpoints: "
-                f"{unloaded_params}"
-            )
 
 
-EntryClass = GemmaForCausalLM
+EntryClass = StableLmForCausalLM

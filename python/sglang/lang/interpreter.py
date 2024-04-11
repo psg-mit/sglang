@@ -248,9 +248,11 @@ class StreamExecutor:
     def set_var(self, name, value):
         self.variables[name] = value
 
-    def get_meta_info(self, name):
+    def get_meta_info(self, name, timeout=None):
         if name in self.variable_event:
-            self.variable_event[name].wait()
+            got = self.variable_event[name].wait(timeout)
+            if not got:
+                raise TimeoutError(f"Timeout while waiting for event '{name}'")
         ret = self.meta_info.get(name, None)
         return ret
 
@@ -276,6 +278,7 @@ class StreamExecutor:
             exes[i].messages_ = list(self.messages_)
             exes[i].cur_role = self.cur_role
             exes[i].fork_start_text_pos = len(self.text_)
+            exes[i].images_ = list(self.images_)
 
         return exes
 
@@ -454,15 +457,19 @@ class StreamExecutor:
             self.stream_var_event[name].set()
 
     def _execute_select(self, expr: SglSelect):
-        decision, normalized_prompt_logprob, prompt_logprob = self.backend.select(
-            self, expr.choices, expr.temperature
-        )
+        (
+            decision,
+            normalized_prompt_logprobs,
+            prefill_token_logprobs,
+            decode_token_logprobs,
+        ) = self.backend.select(self, expr.choices, expr.temperature)
         if expr.name is not None:
             name = expr.name
             self.variables[name] = decision
             self.meta_info[name] = {
-                "normalized_prompt_logprob": normalized_prompt_logprob,
-                "prompt_logprob": prompt_logprob,
+                "normalized_prompt_logprobs": normalized_prompt_logprobs,
+                "prefill_token_logprobs": prefill_token_logprobs,
+                "decode_token_logprobs": decode_token_logprobs,
             }
             self.variable_event[name].set()
         self.text_ += decision
